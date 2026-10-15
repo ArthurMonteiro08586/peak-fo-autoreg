@@ -1,0 +1,9 @@
+imap_pw.txt
+apikey.txt
+peak_bank.jsonl
+chunks/
+logs/
+dbg_imgs/
+dbg_old/
+*.log
+__pycache__/
