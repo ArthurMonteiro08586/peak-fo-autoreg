@@ -10,13 +10,16 @@ import os
 import re
 import sys
 import time
+_VISION_URL = os.environ.get("VISION_BASE", "http://127.0.0.1:16432").rstrip("/") + "/v1/chat/completions"
+_VISION_KEY = os.environ.get("VISION_KEY", "local-vote")
 
-_SIDECAR = os.environ.get("PEAK_SIDECAR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cs_sidecar"))
+_SIDECAR = os.environ.get("PEAK_SIDECAR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cs_sidecar")
 if _SIDECAR not in sys.path:
     sys.path.insert(0, _SIDECAR)
 
 from hcaptcha.image_solve import (  # noqa: E402
     _GRID,
+    _active_canvas_box,
     _challenge_meta,
     _click_submit,
     _click_tiles,
@@ -68,30 +71,40 @@ def task_hint(target: str) -> str:
                 "lizard, crocodile), amphibians (frog), fish, insects, platypus, echidna. "
                 "NOT egg-laying: whale, dolphin, beaver, seal, otter, cat, dog, bear, cow and all other "
                 "placental mammals. Click ONLY cells with egg-laying animals; ignore scenery-only cells.")
-    if "закономерность" in t or "нарушают" in t:
+    if "закономерность" in t or "нарушают" in t or "break the pattern" in t or "pattern" in t:
         return ("Find the items that BREAK the pattern: most items share one style (e.g. faint translucent "
                 "outlines), while the odd ones differ (e.g. solid opaque colored characters), or differ in "
                 "shape family/orientation/count. Compare every cell against the majority and pick the outliers.")
-    if "на линии" in t or "на линиях" in t:
+    if "на линии" in t or "на линиях" in t or "on the line" in t or "on a line" in t:
         return ("Some cells contain a drawn line or stripe; click the cells where a figure/object sits ON, "
                 "TOUCHES or CROSSES that line. Cells without a line, or with a line but no figure on it, are wrong.")
-    if re.search(r"спорт|игр", t):
+    if "яйцекладущ" in t or "egg-laying" in t or "egg laying" in t or "lay eggs" in t:
+        return ("Egg-laying animals: birds (flamingo, chicken, duck, owl...), reptiles (snake, turtle, "
+                "lizard, crocodile), amphibians (frog), fish, insects, platypus, echidna. "
+                "NOT egg-laying: whale, dolphin, beaver, seal, otter, cat, dog, bear, cow and all other "
+                "placental mammals. Click ONLY cells with egg-laying animals; ignore scenery-only cells.")
+    if "covered" in t or "покрыт" in t or "накрыт" in t:
+        return ("A small reference object is shown near the task text (EXAMPLE picture). An item qualifies "
+                "only if that reference object, placed over the item, would hide it COMPLETELY — i.e. the item "
+                "is smaller than or equal to the reference object. Pick cells whose item is small enough to be "
+                "fully covered by the reference; skip items bigger than the reference and empty cells.")
+    if re.search(r"спорт|игр|sport|game|playing", t):
         return ("Sports/games items: balls, rackets, bats, gloves, goals, controllers, chess, cards, dice. "
                 "NOT: everyday electronics (headphones alone), clothing, food.")
     return ""
 
 
-def _vote_model_call(model, image_b64, prompt, timeout=90, temperature=0):
+def _vote_model_call(model, image_b64, prompt, timeout=90, temperature=0, max_tokens=400):
     import json as _json, urllib.request as _ur
     body = _json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image_b64}"}]}],
-        "max_tokens": 400, "temperature": temperature,
+        "max_tokens": max_tokens, "temperature": temperature,
     }).encode()
-    req = _ur.Request("http://127.0.0.1:16432/v1/chat/completions", data=body,
-                      headers={"Content-Type": "application/json", "Authorization": ("Bea"+"rer ") + "local-vote"})
+    req = _ur.Request(_VISION_URL, data=body,
+                      headers={"Content-Type": "application/json", "Authorization": ("Bea"+"rer ") + _VISION_KEY})
     with _ur.urlopen(req, timeout=timeout) as r:
         data = _json.loads(r.read())
     txt = data["choices"][0]["message"]["content"]
@@ -107,8 +120,8 @@ def _text_model_call(model, prompt, timeout=70):
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 900, "temperature": 0,
     }).encode()
-    req = _ur.Request("http://127.0.0.1:16432/v1/chat/completions", data=body,
-                      headers={"Content-Type": "application/json", "Authorization": ("Bea"+"rer ") + "local-vote"})
+    req = _ur.Request(_VISION_URL, data=body,
+                      headers={"Content-Type": "application/json", "Authorization": ("Bea"+"rer ") + _VISION_KEY})
     with _ur.urlopen(req, timeout=timeout) as r:
         data = _json.loads(r.read())
     txt = data["choices"][0]["message"]["content"]
@@ -122,17 +135,31 @@ class Solver:
         self.kp = keypool
 
     # --- two-stage: describe cells with VLM, reason with text LLM ---
-    def describe(self, image_b64):
-        prompt = (
-            "This image is an hCaptcha grid challenge with numbered cells (yellow number "
-            "top-left of each cell). There is usually a small reference/example picture "
-            "near the task text or in a corner.\n"
-            "1) First line: EXAMPLE: <describe the small reference object/picture shown, "
-            "or 'none' if there is no reference picture>.\n"
-            "2) Then for EVERY numbered cell one line: '<number>: <short description of what "
-            "is in that cell>' (objects, colors, orientation, count).\n"
-            "Be precise and factual. Do not solve anything, just describe."
-        )
+    def describe(self, image_b64, note=""):
+        if note:
+            # full-frame challenge screenshot: no yellow labels, unknown dimensions
+            prompt = (
+                note +
+                "Describe the image:\n"
+                "1) First line: EXAMPLE: <describe the small reference object/picture shown, "
+                "or 'none' if there is no reference picture>.\n"
+                "2) State GRID: <rows>x<cols>.\n"
+                "3) Then for EVERY cell one line: '<number>: <short description of what "
+                "is in that cell>' (objects, colors, orientation, count, SIZE relative to "
+                "the EXAMPLE object: smaller / about equal / larger).\n"
+                "Be precise and factual. Do not solve anything, just describe."
+            )
+        else:
+            prompt = (
+                "This image is an hCaptcha grid challenge with numbered cells (yellow number "
+                "top-left of each cell). There is usually a small reference/example picture "
+                "near the task text or in a corner.\n"
+                "1) First line: EXAMPLE: <describe the small reference object/picture shown, "
+                "or 'none' if there is no reference picture>.\n"
+                "2) Then for EVERY numbered cell one line: '<number>: <short description of what "
+                "is in that cell>' (objects, colors, orientation, count).\n"
+                "Be precise and factual. Do not solve anything, just describe."
+            )
         try:
             return _vote_model_call("qwen3-vl-plus", image_b64, prompt, timeout=90)
         except Exception as e:
@@ -374,27 +401,165 @@ async def solve(page, keypool, rounds_max=14, timeout=260):
             pass
 
         import hashlib
-        akey = (target, hashlib.md5(gridded.encode()).hexdigest()[:12])
+        # for "covered by object" tasks the reference EXAMPLE object lives OUTSIDE the
+        # canvas (in the challenge panel) — canvas-only capture is unreadable garbage.
+        # Capture the FULL iframe screenshot instead and let the model number cells itself.
+        full_note = ""
+        model_img = gridded
+        grid_n = [4]  # actual grid dimension (covered tasks are often 3x3)
+        montage_b64 = ""
+        if re.search(r"covered|накрыть|накрыт", target, re.I):
+            try:
+                import base64 as _b64m
+                _fel = await fr.frame_element()
+                png = await _fel.screenshot()
+                shot = _b64m.b64encode(png).decode()
+                _dbg2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dbg_imgs")
+                os.makedirs(_dbg2, exist_ok=True)
+                with open(os.path.join(_dbg2, "r%02d_full_%d.jpg" % (rnd, int(time.time()) % 100000)), "wb") as _f2:
+                    _f2.write(png)
+                model_img = shot
+                full_note = ("NOTE: this image is a FULL screenshot of the challenge window: task text, a small "
+                             "EXAMPLE/reference object, and a photo grid. First determine the grid dimensions from "
+                             "the image (it may be 3x3 OR 4x4). Cells have NO yellow numbers; number them row-major "
+                             "from the top-left starting at 0 (for 3x3: top row = 0,1,2; for 4x4: top row = 0,1,2,3). "
+                             "Use the EXAMPLE object for size comparison. ")
+                log.info("round %d: covered-task -> full frame shot %d bytes", rnd, len(png))
+                # ---- OVERLAY MONTAGE: draw the example FOOTPRINT as a red rectangle
+                # (true pixel size) centered on each cell crop -> model only judges
+                # "does the object protrude past the red rect?" (purely perceptual)
+                try:
+                    from PIL import Image as _PILImage, ImageDraw as _PILDraw
+                    import io as _io
+                    _im = _PILImage.open(_io.BytesIO(png)).convert("RGB")
+                    _W, _H = _im.size
+                    _fbox = await _fel.bounding_box()
+                    _cbox = await _active_canvas_box(fr)
+                    if _fbox and _cbox:
+                        cx0 = int(_cbox["x"] - _fbox["x"]); cy0 = int(_cbox["y"] - _fbox["y"])
+                        cw = int(_cbox["width"]); ch = int(_cbox["height"])
+                    else:
+                        cx0, cy0, cw, ch = 0, int(_H * 0.35), _W, _H - int(_H * 0.35)
+                    _gdim = 3 if cw / max(ch, 1) > 1.2 else 4
+                    grid_n[0] = _gdim
+                    ex = _im.crop((max(_W - 100, 0), 8, _W, min(112, _H)))
+                    ex_w = max(ex.size[0] - 16, 20); ex_h = max(ex.size[1] - 16, 20)
+                    tw = cw // _gdim; th = ch // _gdim
+                    panels = []
+                    for i in range(_gdim * _gdim):
+                        r_, c_ = divmod(i, _gdim)
+                        comp = _im.crop((cx0 + c_ * tw, cy0 + r_ * th,
+                                         cx0 + (c_ + 1) * tw, cy0 + (r_ + 1) * th)).convert("RGB")
+                        d_ = _PILDraw.Draw(comp)
+                        px0 = (comp.size[0] - ex_w) // 2; py0 = (comp.size[1] - ex_h) // 2
+                        d_.rectangle([px0, py0, px0 + ex_w, py0 + ex_h], outline="red", width=3)
+                        d_.rectangle([0, 0, 26, 22], fill="black")
+                        d_.text((4, 4), str(i), fill="yellow")
+                        panels.append(comp)
+                    mw = tw + 6; mh = th + 6
+                    mont = _PILImage.new("RGB", (mw * _gdim, mh * _gdim), "black")
+                    for i, p in enumerate(panels):
+                        r_, c_ = divmod(i, _gdim)
+                        mont.paste(p, (c_ * mw + 3, r_ * mh + 3))
+                    _buf = _io.BytesIO(); mont.save(_buf, "JPEG", quality=88)
+                    montage_b64 = _b64m.b64encode(_buf.getvalue()).decode()
+                    with open(os.path.join(_dbg2, "r%02d_mont_%d.jpg" % (rnd, int(time.time()) % 100000)), "wb") as _fm:
+                        _fm.write(_buf.getvalue())
+                    log.info("round %d: montage built %dx%d grid=%d ex=%s",
+                             rnd, mont.size[0], mont.size[1], _gdim, ex.size)
+                except Exception as e:
+                    log.warning("montage err %r", e)
+            except Exception as e:
+                log.warning("frame shot err %r", e)
+        akey = (target, hashlib.md5(model_img.encode()).hexdigest()[:12])
+        _seen_n = solve._seen.get(target, 0)
+
+        def _ask2(h_):
+            hh = full_note + (h_ or "")
+            # covered-by-object tasks: canvas voting is systematically blind (reference
+            # object is outside the canvas) -> escalate to describe+reason IMMEDIATELY
+            # when we have a full-frame shot; other tasks escalate after 5 failed rounds
+            esc_now = _seen_n >= 5 or (bool(full_note))
+            if esc_now:
+                log.info("round %d: escalate %r -> describe+reason", rnd, target[:40])
+                if montage_b64:
+                    # perceptual red-rect judgement (no size estimation by the model)
+                    try:
+                        mp = ("Panels 0-%d show hCaptcha grid cells (yellow number in top-left = panel id). "
+                              "Each panel has the SAME red rectangle drawn in its CENTER. The red rectangle is "
+                              "the footprint of the EXAMPLE object at TRUE size (the example is the small picture "
+                              "near the task text).\n"
+                              "A panel QUALIFIES if the main object in that photo fits COMPLETELY INSIDE the red "
+                              "rectangle (no part of the object sticks out beyond any red edge).\n"
+                              "Judge each panel strictly by whether the object protrudes past the red rectangle.\n"
+                              "Last line EXACTLY:\n"
+                              "ANSWER: <comma separated qualifying panel numbers> or ANSWER: none"
+                              % (grid_n[0] * grid_n[0] - 1))
+                        mtxt = _vote_model_call("qwen3-vl-plus", montage_b64, mp, timeout=120, max_tokens=700)
+                        mnums = solver._parse(mtxt)
+                        log.info("round %d: montage -> %s", rnd, mnums)
+                        if mtxt and re.search(r"ANSWER\s*:", mtxt):
+                            return mnums
+                    except Exception as e:
+                        log.warning("montage ask err %r", e)
+                if full_note:
+                    # covered-task: direct vision pass on the full-frame shot first
+                    # (describe step mis-estimates relative sizes -> reason inherits the error)
+                    try:
+                        cp = (full_note +
+                              'TASK: "' + target + '" (Russian; = click all items that can be COMPLETELY '
+                              'COVERED by the small EXAMPLE object shown near the task text).\n'
+                              "An item qualifies ONLY if its bounding box is SMALLER THAN OR EQUAL to the "
+                              "EXAMPLE's bounding box in BOTH width and height. Items filling the full cell "
+                              "width are usually WIDER than the small example -> disqualified.\n"
+                              "Reply format — FIRST line exactly 'GRID: <rows>x<cols>' (count the photo grid), "
+                              "then ONE short line per cell 'N: OK/NO (why)', then the FINAL line exactly:\n"
+                              "ANSWER: <comma separated cell numbers> or ANSWER: none")
+                        dtxt = _vote_model_call("qwen3-vl-plus", model_img, cp, timeout=140, max_tokens=1400)
+                        dnums = solver._parse(dtxt)
+                        gm = re.search(r"GRID:\s*(\d)\s*[xX\u00d7]\s*(\d)", dtxt or "")
+                        if not montage_b64 and gm and gm.group(1) == gm.group(2) and gm.group(1) in "23":
+                            grid_n[0] = int(gm.group(1))
+                            log.info("round %d: covered GRID %dx%d detected", rnd, grid_n[0], grid_n[0])
+                        log.info("round %d: covered direct -> %s", rnd, dnums)
+                        if dnums:
+                            return dnums
+                    except Exception as e:
+                        log.warning("covered direct err %r", e)
+                try:
+                    desc = solver.describe(model_img, note=full_note)
+                    gm2 = re.search(r"GRID:\s*(\d)\s*[xX\u00d7]\s*(\d)", desc or "")
+                    if gm2 and gm2.group(1) == gm2.group(2) and gm2.group(1) in "23":
+                        grid_n[0] = int(gm2.group(1))
+                    rtxt = solver.reason(target, desc, need, hh, gh)
+                    nums = solver._parse(rtxt)
+                    if nums or (rtxt and "none" in rtxt.lower().splitlines()[-1]):
+                        log.info("round %d: reason path -> %s", rnd, nums)
+                        return nums
+                except Exception as e:
+                    log.warning("reason path err %r", e)
+            return solver.ask(model_img, target, need, hh, gh)
+
         if akey == getattr(solve, "_last_key", None) and getattr(solve, "_last_cells", None):
             prev = solve._last_cells
             log.info("round %d: SAME task+image — previous pick %s was WRONG, re-ask excluding", rnd, prev)
             wrong_hint = ((hint + " ") if hint else "") + \
                 f"Your previous answer {prev} was WRONG. Do NOT pick cells {prev} again; choose different cells."
-            cells2 = await asyncio.to_thread(solver.ask, gridded, target, need, wrong_hint, gh)
+            cells2 = await asyncio.to_thread(_ask2, wrong_hint)
             cells = [c for c in cells2 if c not in prev]
             if not cells:
                 cells = cells2 or prev  # fallback: submit may have failed, reuse prev
             solve._last_key = None
             solve._last_cells = cells
         else:
-            cells = await asyncio.to_thread(solver.ask, gridded, target, need, hint, gh)
+            cells = await asyncio.to_thread(_ask2, hint)
             solve._last_key = akey
             solve._last_cells = cells
         log.info("round %d: picked %s", rnd, cells)
         if not cells and not gh and not hint:
             # totally unknown task type -> skip it (Пропустить) to conserve attempts
             pass
-        N = _GRID * _GRID
+        N = grid_n[0] * grid_n[0]
         cells = list(dict.fromkeys(c for c in cells if 0 <= c < N))
         if need and len(cells) > need:
             cells = cells[:need]
@@ -407,7 +572,7 @@ async def solve(page, keypool, rounds_max=14, timeout=260):
             if len(cells2) == need:
                 cells = cells2
         try:
-            await _click_tiles(page, fr, cells)
+            await _click_tiles(page, fr, cells, grid=grid_n[0])
         except Exception as e:
             log.warning("click tiles err: %r", e)
         await asyncio.sleep(0.6)

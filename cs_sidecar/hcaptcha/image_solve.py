@@ -152,19 +152,21 @@ async def _classify_tiles(fr, keypool, target: str) -> list[int]:
     return await _pick_cells(fr, keypool, target)
 
 
-async def _click_tiles(page, fr, indices: list[int]) -> None:
+async def _click_tiles(page, fr, indices: list[int], grid: int = None) -> None:
     """Click matching tile positions on the canvas via page.mouse.
 
     page.mouse.click dispatches real OS-level events that hCaptcha respects.
+    grid: actual grid dimension (3 for 3x3 covered-tasks); defaults to _GRID (4).
     """
     cbox = await _active_canvas_box(fr)
     if not cbox:
         return
-    tw = cbox["width"] / _GRID
-    th = cbox["height"] / _GRID
+    g = grid or _GRID
+    tw = cbox["width"] / g
+    th = cbox["height"] / g
     for idx in indices:
-        col = idx % _GRID
-        row = idx // _GRID
+        col = idx % g
+        row = idx // g
         x = cbox["x"] + (col + 0.5) * tw
         y = cbox["y"] + (row + 0.5) * th
         try:
@@ -268,37 +270,107 @@ async def _solve_drag(fr, page, keypool, task_text: str = "") -> bool:
             log.info("_solve_drag: puzzle parse failed -> grid fallback")
             return await _solve_drag_grid(fr, page, keypool)
     elif balance:
-        # Two simple vision calls beat one complex format (model compliance).
+        # one-shot DOM forensics: capture the real widget structure (tokens,
+        # buttons, canvas box) — the side panel may be DOM, not canvas.
+        if not _drag_state.get("dom_dumped"):
+            _drag_state["dom_dumped"] = True
+            try:
+                import os, json as _j
+                d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "dbg_imgs")
+                os.makedirs(d, exist_ok=True)
+                html = await fr.evaluate("document.body.outerHTML")
+                with open(os.path.join(d, "balance_dom.html"), "w", encoding="utf-8") as f:
+                    f.write(html)
+                boxes = await fr.evaluate(
+                    "() => { const out = []; "
+                    "document.querySelectorAll('canvas, button, img, svg, [draggable], [class*=drag], [class*=move], [class*=animal], [class*=pan], [class*=token]').forEach(el => { "
+                    "const r = el.getBoundingClientRect(); "
+                    "if (r.width > 0 && r.height > 0) out.push({tag: el.tagName, cls: (el.className||'').toString().slice(0,90), txt: (el.innerText||el.alt||'').slice(0,50), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}); }); "
+                    "return out; }"
+                )
+                with open(os.path.join(d, "balance_boxes.json"), "w") as f:
+                    f.write(_j.dumps(boxes, indent=1))
+                log.info("balance DOM dumped: %d boxes, html %d chars", len(boxes), len(html))
+            except Exception as e:
+                log.warning("balance dom dump err: %s", str(e)[:120])
+        # REAL mechanics (forensics 2026-10-15, full-page screenshots):
+        # - center: balance scale; the HEAVIER (lower) pan holds one animal
+        #   that the LIGHTER pan is missing.
+        # - RIGHT-side panel (x~82-94%): TWO draggable animal tokens stacked
+        #   vertically (TOP and BOTTOM), each with a "+ Move" pill above it.
+        #   One token matches the missing animal; the other is a distractor.
+        # - Correct action: drag the MATCHING token onto the LIGHTER pan.
+        # Grounded balance flow v2: ONE vision query returns the '+ Move'
+        # pill of the matching token AND the lighter pan center as percents
+        # of the canvas image. Fixed geometry missed real layouts (2 vs 3
+        # tokens, variable pill positions) — forensics 21:32 proved it.
         p1 = (
-            "This image shows a seesaw / balance scale and one animal. "
-            "Reply with ONLY the center of the ANIMAL as two numbers: X,Y — "
-            "percentages of image width and height (0-100). No other text. "
-            "Example: 50,85"
+            "hCaptcha balance-scale challenge. Center: a scale with two pans, "
+            "one pan hangs LOWER (heavier), the other HIGHER (lighter) and is "
+            "missing one animal. Right side: a panel of animal tokens, each "
+            "with a small '+ Move' button above it. Compare the animals on "
+            "both pans and find which animal the LIGHTER pan is missing. "
+            "Reply with ONLY 4 integers separated by spaces: PX PY TX TY = "
+            "percent coordinates (0-100 of image width, height): PX,PY is the "
+            "'+ Move' button above the matching token in the right panel; "
+            "TX,TY is the center of the LIGHTER pan. Example: 88 30 28 55"
         )
         t1 = await asyncio.to_thread(keypool.ask, b64, p1)
-        log.info("_solve_drag balance animal -> %r", t1[:100])
-        n1 = re.findall(r"\d+(?:\.\d+)?", t1 or "")
-        if len(n1) < 2:
-            log.info("_solve_drag: animal parse failed -> grid fallback")
-            return await _solve_drag_grid(fr, page, keypool)
-        ax, ay = float(n1[0]), float(n1[1])
-        p2 = (
-            "This image shows a seesaw / balance scale with a LEFT pan and a "
-            "RIGHT pan. One pan sits HIGHER than the other (it is lighter and "
-            "needs weight). Reply with ONLY one letter: L if the LEFT pan is "
-            "higher, R if the RIGHT pan is higher."
-        )
-        t2 = await asyncio.to_thread(keypool.ask, b64, p2)
-        log.info("_solve_drag balance side -> %r", t2[:40])
-        up = (t2 or "").strip().upper()
-        pick_left = up.startswith("L") or ("L" in up and "R" not in up)
-        if not (pick_left or "R" in up):
-            pick_left = True  # default guess; alt flips it
-        if alt:
-            pick_left = not pick_left  # alternate pan on retry
-        # standard hCaptcha seesaw layout: pans ~1/4 and ~3/4 width
-        tx, ty = (21.0, 58.0) if pick_left else (79.0, 58.0)
-        sx, sy = ax, ay
+        log.info("_solve_drag balance grounding -> %r", (t1 or "")[:90])
+        nums = re.findall(r"\d+(?:\.\d+)?", t1 or "")
+        n = _drag_state["calls"] + 1
+        if len(nums) >= 4:
+            gx, gy, tx2, ty2 = (float(v) for v in nums[:4])
+        else:
+            # legacy fallback: fixed geometry, alternate token/pan per round
+            gx, gy = 88.0, (30.0 if n % 2 == 1 else 44.0)
+            tx2, ty2 = (28.0, 55.0) if n % 2 == 1 else (72.0, 55.0)
+        # escalation: round 2+ targets the OPPOSITE pan (vision may confuse
+        # heavier/lighter); round 3+ shifts to the token below (distractor).
+        if n >= 2:
+            tx2 = 100.0 - tx2
+        if n >= 3:
+            gy = min(gy + 14.0, 92.0)
+        gx = min(max(gx, 2.0), 98.0); gy = min(max(gy, 2.0), 98.0)
+        tx2 = min(max(tx2, 2.0), 98.0); ty2 = min(max(ty2, 2.0), 98.0)
+        # ODD rounds: '+ Move' accessibility click-path (click pill, then
+        # click pan) with a MID screenshot to see if pill-click arms a mode.
+        # EVEN rounds: fall through to raw drag from token (just below pill).
+        if n % 2 == 1:
+            cbox2 = await _active_canvas_box(fr)
+            if cbox2:
+                pill_x = cbox2["x"] + cbox2["width"] * gx / 100.0
+                pill_y = cbox2["y"] + cbox2["height"] * gy / 100.0
+                pan_x = cbox2["x"] + cbox2["width"] * tx2 / 100.0
+                pan_y = cbox2["y"] + cbox2["height"] * ty2 / 100.0
+                log.info("_solve_drag[balance-click] n=%d pill=(%.0f,%.0f) pan=(%.0f,%.0f)",
+                         n, pill_x, pill_y, pan_x, pan_y)
+                import os as _os, time as _t
+                try:
+                    d2 = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "dbg_imgs")
+                    _os.makedirs(d2, exist_ok=True)
+                    tag2 = _t.strftime("%H%M%S")
+                except Exception:
+                    d2 = None
+                    tag2 = None
+                await page.mouse.click(pill_x, pill_y)
+                await asyncio.sleep(0.4)
+                if d2:
+                    try:
+                        await page.screenshot(path=_os.path.join(d2, f"click_mid_{tag2}.jpg"), quality=70, type="jpeg")
+                    except Exception:
+                        pass
+                await page.mouse.click(pan_x, pan_y)
+                await asyncio.sleep(1.0)
+                if d2:
+                    try:
+                        await page.screenshot(path=_os.path.join(d2, f"click_after_{tag2}.jpg"), quality=70, type="jpeg")
+                    except Exception:
+                        pass
+                return True
+        # drag path: grab the TOKEN itself (a bit below its pill), drop on pan
+        sx, sy = gx, min(gy + 8.0, 96.0)
+        tx, ty = tx2, ty2
     else:
         prompt = (
             "hCaptcha drag challenge. Reply with ONLY one line, no prose: "
@@ -325,7 +397,40 @@ async def _solve_drag(fr, page, keypool, task_text: str = "") -> bool:
     mode = "puzzle" if puzzle else ("balance" if balance else "generic")
     log.info("_solve_drag[%s]: attempt %d src=(%.0f,%.0f) dst=(%.0f,%.0f)",
              mode, _drag_state["calls"] + 1, ax_, ay_, ex_, ey_)
-    return await _human_drag(page, ax_, ay_, ex_, ey_)
+    # forensics: screenshot before/after drag so we can SEE if the sprite moved
+    tag = None
+    d = None
+    try:
+        import os, time as _t
+        d = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "dbg_imgs")
+        os.makedirs(d, exist_ok=True)
+        tag = _t.strftime("%H%M%S")
+        await page.screenshot(path=os.path.join(d, f"drag_before_{tag}.jpg"), quality=70, type="jpeg")
+    except Exception:
+        tag = None
+    ok = await _human_drag(page, ax_, ay_, ex_, ey_)
+    if tag:
+        try:
+            # draw crosshair markers at the mapped src/dst points AFTER drag
+            await page.evaluate(
+                """(pts) => {
+                    document.querySelectorAll('[data-enimark]').forEach(e => e.remove());
+                    for (const [x, y, c] of pts) {
+                        const d = document.createElement('div');
+                        d.setAttribute('data-enimark', '1');
+                        d.style.cssText = 'position:fixed;z-index:2147483647;width:26px;height:26px;'
+                          + 'border:3px solid ' + c + ';border-radius:50%;pointer-events:none;'
+                          + 'left:' + (x - 13) + 'px;top:' + (y - 13) + 'px;';
+                        document.body.appendChild(d);
+                    }
+                }""",
+                [[ax_, ay_, "red"], [ex_, ey_, "lime"]],
+            )
+            await asyncio.sleep(0.4)
+            await page.screenshot(path=os.path.join(d, f"drag_after_{tag}.jpg"), quality=70, type="jpeg")
+        except Exception:
+            pass
+    return ok
 
 
 async def _human_drag(page, sx, sy, tx, ty) -> bool:

@@ -1,13 +1,13 @@
 # peak.fo mass-reg: hcaptcha local solve -> Supabase GoTrue signup
 import sys, os, time, json, random, string, asyncio, re
 
-_home = os.path.expanduser("~")
-os.environ.setdefault("USERPROFILE", _home)
-os.environ.setdefault("HOME", _home)
+os.environ.setdefault("USERPROFILE", os.path.expanduser("~"))
+os.environ.setdefault("HOME", os.path.expanduser("~"))
 os.environ.setdefault("PROCESSOR_ARCHITECTURE", "AMD64")
 sys.stdout.reconfigure(encoding="utf-8")
-PEAK_HOME = os.environ.get("PEAK_HOME", os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.environ.get("PEAK_SIDECAR", os.path.join(PEAK_HOME, "cs_sidecar")))
+_SIDECAR = os.environ.get("PEAK_SIDECAR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "cs_sidecar")
+if _SIDECAR not in sys.path:
+    sys.path.insert(0, _SIDECAR)
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -16,16 +16,17 @@ from curl_cffi import requests as cr
 from hcaptcha.image_solve import solve_hcaptcha_challenge, _find_challenge_frame, _challenge_meta
 from common.mistral import KeyPool
 
-SITEKEY = "3b6002f2-f1d8-450e-81f0-866a70a0031e"
-BANK = os.path.join(PEAK_HOME, "peak_bank.jsonl")
+SITEKEY = os.environ.get("PEAK_SITEKEY", "3b6002f2-f1d8-450e-81f0-866a70a0031e")
+BANK = os.environ.get("PEAK_BANK", os.path.join(os.path.dirname(os.path.abspath(__file__)), "peak_bank.jsonl"))
 import re as _re
 import glob as _glob
-_cands = sorted(_glob.glob(os.path.join(PEAK_HOME, "chunks", "*.js")))
-if not _cands:
-    raise SystemExit("no JS bundle in chunks/ - run fetch_peak_bundle.py first")
-_bundle = open(_cands[-1], encoding="utf-8").read()
-SUPA_URL = _re.search(r'https://[a-z0-9]+\.supabase\.co', _bundle).group(0)
-ANON_KEY = _re.search(r'sb_publishable_[A-Za-z0-9_\-]{10,}', _bundle).group(0)
+_bundle = ""
+for _cf in sorted(_glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "chunks", "*.js"))):
+    _bundle += open(_cf, encoding="utf-8", errors="replace").read()
+if not _bundle:
+    raise SystemExit("no chunks/*.js - run fetch_peak_bundle.py first")
+SUPA_URL = os.environ.get("PEAK_SUPA_URL") or _re.search(r'https://[a-z0-9]+\.supabase\.co', _bundle).group(0)
+ANON_KEY = os.environ.get("PEAK_ANON_KEY") or _re.search(r'sb_publishable_[A-Za-z0-9_\-]{10,}', _bundle).group(0)
 
 VOTE_MODELS = ["qwen3-vl-plus"]
 VOTE_ENDPOINT = "http://127.0.0.1:16432/v1/chat/completions"

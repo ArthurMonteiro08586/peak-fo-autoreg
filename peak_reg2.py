@@ -14,16 +14,15 @@ PXD = {"http": PEAK_PROXY, "https": PEAK_PROXY} if PEAK_PROXY else None
 if PEAK_PROXY:
     log("using proxy", PEAK_PROXY.split("@")[-1])
 
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_PW = os.environ.get("GMAIL_APP_PW") or open(os.path.join(BASE, "imap_pw.txt"), encoding="utf-8").read().strip()
+GMAIL_USER = os.environ["IMAP_USER"]
+GMAIL_PW = os.environ["IMAP_PASS"]
 USED = os.path.join(BASE, "used_aliases.txt")
 PK = "Pk" + "".join(random.choices(string.ascii_letters, k=2))
 
-ALIAS_DOMAIN = os.environ.get("PEAK_ALIAS_DOMAIN", "example.com")
-
 def gen_alias():
-    # catch-all domain -> ForwardEmail -> your IMAP mailbox (unique local part, no normalization)
-    email = "pk%d%s@" + ALIAS_DOMAIN + "" % (int(time.time()), "".join(random.choices(string.ascii_lowercase, k=3)))
+    # catch-all domain -> forwarder -> your IMAP mailbox (unique local part, no normalization)
+    email = "pk%d%s@%s" % (int(time.time()), "".join(random.choices(string.ascii_lowercase, k=3)),
+                        os.environ.get("PEAK_ALIAS_DOMAIN", "example.com"))
     return email
 
 def mark_used(email):
@@ -57,7 +56,7 @@ def fetch_confirm_link(since_ts, timeout=150):
     while time.time() - t0 < timeout:
         try:
             if m is None:
-                m = imaplib.IMAP4_SSL("imap.gmail.com")
+                m = imaplib.IMAP4_SSL(os.environ.get("IMAP_HOST", "imap.gmail.com"), int(os.environ.get("IMAP_PORT", "993")))
                 m.login(GMAIL_USER, GMAIL_PW)
                 m.select("INBOX")
             # fast server-side search; fallback to last-30 UNSEEN scan

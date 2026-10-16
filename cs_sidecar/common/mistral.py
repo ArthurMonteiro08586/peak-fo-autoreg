@@ -1,3 +1,4 @@
+import os
 """Mistral vision key pool — round-robin + auto-failover over many API keys.
 
 Shared by the reCAPTCHA and hCaptcha image solvers. Exposes `classify` (yes/no),
@@ -16,12 +17,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import os
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_ENDPOINT = "http://127.0.0.1:16432/v1/chat/completions"
+_ENDPOINT = os.environ.get("VISION_BASE", "http://127.0.0.1:16432").rstrip("/") + "/v1/chat/completions"
 # pixtral-12b aliases to a text model on this gateway; medium is the cheapest id
 # that actually does vision here.
 _DEFAULT_MODEL = "qwen3-vl-plus"
@@ -138,7 +138,7 @@ class KeyPool:
 
 # self-check: pool loads, rotates, and a 1x1 red tile classifies without crashing.
 if __name__ == "__main__":
-    pool = KeyPool(os.environ.get("VISION_KEYS_FILE", str(Path(__file__).parent / "apikey.txt")))
+    pool = KeyPool(str(Path(__file__).parent / "apikey.txt"))
     print("keys loaded:", len(pool.keys))
     red = ("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAEUlEQVR42mP8"
            "z8BQz0AEYBxVSFXyW3aBAAAAAElFTkSuQmCC")

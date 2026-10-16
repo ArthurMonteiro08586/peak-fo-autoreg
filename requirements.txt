@@ -1,0 +1,3 @@
+curl_cffi>=0.7
+pillow>=10.0
+cloakbrowser>=0.1

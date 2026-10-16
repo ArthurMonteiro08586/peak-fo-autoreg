@@ -5,17 +5,16 @@ Usage: python confirm_sweep.py [max_age_hours=6]
 """
 import imaplib, json, os, re, sys, time, quopri
 BASE = os.path.dirname(os.path.abspath(__file__))
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_PW = os.environ.get("GMAIL_APP_PW") or open(os.path.join(BASE, "imap_pw.txt"), encoding="utf-8").read().strip()
+GMAIL_USER = os.environ["IMAP_USER"]
+GMAIL_PW = os.environ["IMAP_PASS"]
 BANK = os.path.join(BASE, "peak_bank.jsonl")
 LINK_RE = re.compile(r'https://[a-zA-Z0-9.\-]+\.supabase\.co/auth/v1/verify\?[^\s"\'<>]+')
-ALIAS_DOMAIN = os.environ.get("PEAK_ALIAS_DOMAIN", "example.com")
-ALIAS_RE = re.compile(r'(pk\d+[a-z]{3}@' + re.escape(ALIAS_DOMAIN) + r')')
+ALIAS_RE = re.compile(r'(pk\d+[a-z]{3}@' + re.escape(os.environ.get('PEAK_ALIAS_DOMAIN', 'example.com')) + r')')
 
 def main():
     max_age_h = float(sys.argv[1]) if len(sys.argv) > 1 else 6.0
     from curl_cffi import requests as creq
-    M = imaplib.IMAP4_SSL("imap.gmail.com")
+    M = imaplib.IMAP4_SSL(os.environ.get("IMAP_HOST", "imap.gmail.com"), int(os.environ.get("IMAP_PORT", "993")))
     M.login(GMAIL_USER, GMAIL_PW)
     M.select("INBOX")
     typ, data = M.search(None, '(SUBJECT "Confirm your email address")')
